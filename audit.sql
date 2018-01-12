@@ -4,7 +4,7 @@
 -- This file should be generic and not depend on application roles or structures,
 -- as it's being listed here:
 --
---    https://wiki.postgresql.org/wiki/Audit_trigger_91plus    
+--    https://wiki.postgresql.org/wiki/Audit_trigger_91plus
 --
 -- This trigger was originally based on
 --   http://wiki.postgresql.org/wiki/Audit_trigger
@@ -137,7 +137,7 @@ BEGIN
         excluded_cols = TG_ARGV[1]::text[];
         RAISE WARNING '[audit.if_modified_func] - Trigger func triggered with excluded_cols: %',TG_ARGV[1];
     END IF;
-    
+
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
         h_old = hstore(OLD.*) - excluded_cols;
         audit_row.row_data = h_old;
@@ -151,12 +151,12 @@ BEGIN
         END IF;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
   RETURN NEW;
-        
+
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(OLD.*) - excluded_cols;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
         RETURN OLD;
-        
+
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(NEW.*) - excluded_cols;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
@@ -228,8 +228,8 @@ BEGIN
         IF array_length(ignored_cols,1) > 0 THEN
             _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
         END IF;
-        _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' || 
-                 target_table::TEXT || 
+        _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' ||
+                 target_table::TEXT ||
 
                  ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || ');';
@@ -317,7 +317,7 @@ BEGIN
     from
         event, where_pks
     ;
-    
+
     execute query;
 END;
 $body$
@@ -325,7 +325,7 @@ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION audit.replay_event(int) IS $body$
 Replay a logged event.
- 
+
 Arguments:
    pevent_id:  The event_id of the event in audit.logged_actions to replay
 $body$;
@@ -339,22 +339,22 @@ DECLARE
 BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_view::text;
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_view::text;
- 
-	IF array_length(ignored_cols,1) > 0 THEN
-	    _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
-	END IF;
-	_q_txt = 'CREATE TRIGGER audit_trigger_row INSTEAD OF INSERT OR UPDATE OR DELETE ON ' || 
-		 target_view::TEXT || 
-		 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
-		 quote_literal(audit_query_text) || _ignored_cols_snip || ');';
-	RAISE NOTICE '%',_q_txt;
-	EXECUTE _q_txt;
+
+    IF array_length(ignored_cols,1) > 0 THEN
+        _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
+    END IF;
+    _q_txt = 'CREATE TRIGGER audit_trigger_row INSTEAD OF INSERT OR UPDATE OR DELETE ON ' ||
+         target_view::TEXT ||
+         ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
+         quote_literal(audit_query_text) || _ignored_cols_snip || ');';
+    RAISE NOTICE '%',_q_txt;
+    EXECUTE _q_txt;
 
     -- store uid columns if not already present
   IF (select count(*) from audit.logged_relations where relation_name = (select target_view)::text AND  uid_column= (select unnest(uid_cols))::text) = 0 THEN
       insert into audit.logged_relations (relation_name, uid_column)
        select target_view, unnest(uid_cols);
-  END IF;    
+  END IF;
 
 END;
 $body$
@@ -362,22 +362,98 @@ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION audit.audit_view(regclass, BOOLEAN, text[], text[]) IS $body$
 ADD auditing support TO a VIEW.
- 
+
 Arguments:
    target_view:      TABLE name, schema qualified IF NOT ON search_path
    audit_query_text: Record the text of the client query that triggered the audit event?
    ignored_cols:     COLUMNS TO exclude FROM UPDATE diffs, IGNORE updates that CHANGE only ignored cols.
    uid_cols:         COLUMNS to use to uniquely identify a row from the view (in order to replay UPDATE and DELETE)
 $body$;
- 
+
 -- Pg doesn't allow variadic calls with 0 params, so provide a wrapper
 CREATE OR REPLACE FUNCTION audit.audit_view(target_view regclass, audit_query_text BOOLEAN, uid_cols text[]) RETURNS void AS $body$
 SELECT audit.audit_view($1, $2, ARRAY[]::text[], uid_cols);
 $body$ LANGUAGE SQL;
- 
+
 -- And provide a convenience call wrapper for the simplest case
 -- of row-level logging with no excluded cols and query logging enabled.
 --
 CREATE OR REPLACE FUNCTION audit.audit_view(target_view regclass, uid_cols text[]) RETURNS void AS $$
 SELECT audit.audit_view($1, BOOLEAN 't', uid_cols);
 $$ LANGUAGE 'sql';
+
+-- Function to rollback and event
+CREATE OR REPLACE FUNCTION audit.rollback_event(pevent_id bigint) RETURNS void AS $body$
+DECLARE
+    event record;
+    pkeys record;
+    last_event record;
+    query text;
+BEGIN
+    -- Get event
+    SELECT * INTO event FROM audit.logged_actions WHERE event_id = pevent_id;
+    -- RAISE NOTICE 'event id = %', event.event_id;
+
+    -- Get the WHERE clause to filter the events feature
+    SELECT INTO pkeys
+        array_to_string(array_agg(uid_column || '=' || quote_literal(event.row_data->uid_column)), ' AND ') AS where_clause,
+        hstore(array_agg(uid_column), array_agg( event.row_data->uid_column)) AS hstore_keys
+    FROM audit.logged_relations r
+    WHERE relation_name = (event.schema_name || '.' || event.table_name)
+    ;
+    -- RAISE NOTICE 'hstore_keys = %', pkeys.hstore_keys;
+
+    -- Check if this is the last event for the feature. If not cancel the rollback
+    SELECT INTO last_event
+        (pevent_id = la.event_id) AS is_last,
+        la.event_id
+    FROM audit.logged_actions AS la
+    WHERE true
+    AND la.schema_name = event.schema_name
+    AND la.table_name = event.table_name
+    AND la.row_data @> pkeys.hstore_keys
+    ORDER BY la.action_tstamp_tx DESC
+    LIMIT 1
+    ;
+    IF NOT last_event.is_last THEN
+        RAISE EXCEPTION '[audit.rollback_event] - Cannot rollback this event (id = %) because a more recent event (id = %) exists for this feature', pevent_id, last_event.event_id;
+        RETURN;
+    END IF;
+
+
+    -- Then apply the rollback
+    SELECT INTO query
+        CASE
+            WHEN action = 'I' THEN
+                'DELETE FROM ' || schema_name || '.' || table_name ||
+                ' WHERE ' || pkeys.where_clause
+            WHEN action = 'D' THEN
+                'INSERT INTO ' || schema_name || '.' || table_name ||
+                ' ('||(SELECT string_agg(key, ',') FROM each(row_data))||') VALUES ' ||
+                '('||(SELECT string_agg(CASE WHEN value IS NULL THEN 'null' ELSE quote_literal(value) END, ',') FROM each(row_data))||')'
+            WHEN action = 'U' THEN
+                'UPDATE ' || schema_name || '.' || table_name ||
+                ' SET ' || (
+                    SELECT string_agg(
+                        key || '=' || CASE WHEN value IS NULL THEN 'null' ELSE quote_literal(value) END
+                        , ','
+                    ) FROM each(row_data) WHERE key = ANY (akeys(changed_fields)) ) ||
+                ' WHERE ' || pkeys.where_clause
+
+        END
+    FROM
+        audit.logged_actions
+    WHERE event_id = pevent_id
+    ;
+
+    execute query;
+END;
+$body$
+LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION audit.rollback_event(bigint) IS $body$
+Rollback a logged event and returns to previous row data
+
+Arguments:
+   pevent_id:  The event_id of the event in audit.logged_actions to rollback
+$body$;
