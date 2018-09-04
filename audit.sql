@@ -458,3 +458,31 @@ Rollback a logged event and returns to previous row data
 Arguments:
    pevent_id:  The event_id of the event in audit.logged_actions to rollback
 $body$;
+
+
+-- The operator to remove multiple keys from a jsonb object (jsonb - text[]) is built in by default from postgres 10
+-- For postgres versions < 10, uncomment the lines below to create the operator
+
+-- CREATE OR REPLACE FUNCTION jsonb_remove_keys(
+--     jdata JSONB,
+--     keys TEXT[]
+-- )
+-- RETURNS JSONB AS $$
+-- DECLARE
+--     result JSONB;
+--     key TEXT;
+-- BEGIN
+--     result = jdata;
+--     FOREACH key IN ARRAY keys
+--     LOOP
+--         result = (result - key);
+--     END LOOP;
+--     RETURN result;
+-- END;
+-- $$ LANGUAGE plpgsql;
+
+-- CREATE OPERATOR - (
+--     PROCEDURE = jsonb_remove_keys,
+--     LEFTARG   = jsonb,
+--     RIGHTARG  = text[] 
+-- );
