@@ -1,4 +1,4 @@
-﻿-- An audit history is important on most tables. Provide an audit trigger that logs to
+-- An audit history is important on most tables. Provide an audit trigger that logs to
 -- a dedicated audit table for the major relations.
 --
 -- This file should be generic and not depend on application roles or structures,
