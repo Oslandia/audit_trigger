@@ -12,8 +12,6 @@
 --
 -- Should really be converted into a relocatable EXTENSION, with control and upgrade files.
 
-CREATE EXTENSION IF NOT EXISTS hstore;
-
 CREATE SCHEMA audit;
 REVOKE ALL ON SCHEMA audit FROM public;
 
@@ -29,7 +27,7 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 -- inserts.
 --
 -- Every index you add has a big impact too, so avoid adding indexes to the
--- audit table unless you REALLY need them. The hstore GIST indexes are
+-- audit table unless you REALLY need them. The json GIN/GIST indexes are
 -- particularly expensive.
 --
 -- It is sometimes worth copying the audit table, or a coarse subset of it that
@@ -53,8 +51,8 @@ CREATE TABLE audit.logged_actions (
     client_port integer,
     client_query text NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
-    row_data hstore,
-    changed_fields hstore,
+    row_data jsonb,
+    changed_fields jsonb,
     statement_only boolean not null
 );
 
@@ -98,8 +96,8 @@ DECLARE
     audit_row audit.logged_actions;
     include_values boolean;
     log_diffs boolean;
-    h_old hstore;
-    h_new hstore;
+    h_old jsonb;
+    h_new jsonb;
     excluded_cols text[] = ARRAY[]::text[];
 BEGIN
     --RAISE WARNING '[audit.if_modified_func] start with TG_ARGV[0]: % ; TG_ARGV[1] : %, TG_OP: %, TG_LEVEL : %, TG_WHEN: % ', TG_ARGV[0], TG_ARGV[1], TG_OP, TG_LEVEL, TG_WHEN;
@@ -139,26 +137,29 @@ BEGIN
     END IF;
 
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        h_old = hstore(OLD.*) - excluded_cols;
-        audit_row.row_data = h_old;
-        h_new = hstore(NEW.*)- excluded_cols;
-        audit_row.changed_fields =  h_new - h_old;
-
-        IF audit_row.changed_fields = hstore('') THEN
+        audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
+        --Computing differences
+            SELECT 
+                jsonb_object_agg(tmp_new_row.key, tmp_new_row.value) AS new_data
+                INTO audit_row.changed_fields
+            FROM jsonb_each_text(row_to_json(NEW)::JSONB) AS tmp_new_row 
+                JOIN jsonb_each_text(audit_row.row_data) AS tmp_old_row ON (tmp_new_row.key = tmp_old_row.key AND tmp_new_row.value IS DISTINCT FROM tmp_old_row.value);
+        
+        IF audit_row.changed_fields = '{}'::JSONB THEN
             -- All changed fields are ignored. Skip this update.
-            RAISE WARNING '[audit.if_modified_func] - Trigger detected NULL hstore. ending';
+            RAISE WARNING '[audit.if_modified_func] - Trigger detected empty json. ending';
             RETURN NULL;
         END IF;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
   RETURN NEW;
 
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = hstore(OLD.*) - excluded_cols;
+        audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
         RETURN OLD;
 
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = hstore(NEW.*) - excluded_cols;
+        audit_row.row_data = row_to_json(NEW)::JSONB - excluded_cols;
   INSERT INTO audit.logged_actions VALUES (audit_row.*);
         RETURN NEW;
 
@@ -397,11 +398,11 @@ BEGIN
     -- Get the WHERE clause to filter the events feature
     SELECT INTO pkeys
         array_to_string(array_agg(uid_column || '=' || quote_literal(event.row_data->uid_column)), ' AND ') AS where_clause,
-        hstore(array_agg(uid_column), array_agg( event.row_data->uid_column)) AS hstore_keys
+        row_to_json(array_agg(uid_column), array_agg( event.row_data->uid_column))::JSONB AS jsonb_keys
     FROM audit.logged_relations r
     WHERE relation_name = (event.schema_name || '.' || event.table_name)
     ;
-    -- RAISE NOTICE 'hstore_keys = %', pkeys.hstore_keys;
+    -- RAISE NOTICE 'jsonb_keys = %', pkeys.jsonb_keys;
 
     -- Check if this is the last event for the feature. If not cancel the rollback
     SELECT INTO last_event
@@ -411,7 +412,7 @@ BEGIN
     WHERE true
     AND la.schema_name = event.schema_name
     AND la.table_name = event.table_name
-    AND la.row_data @> pkeys.hstore_keys
+    AND la.row_data @> pkeys.jsonb_keys
     ORDER BY la.action_tstamp_tx DESC
     LIMIT 1
     ;
@@ -457,3 +458,31 @@ Rollback a logged event and returns to previous row data
 Arguments:
    pevent_id:  The event_id of the event in audit.logged_actions to rollback
 $body$;
+
+
+-- The operator to remove multiple keys from a jsonb object (jsonb - text[]) is built in by default from postgres 10
+-- For postgres versions < 10, uncomment the lines below to create the operator
+
+-- CREATE OR REPLACE FUNCTION jsonb_remove_keys(
+--     jdata JSONB,
+--     keys TEXT[]
+-- )
+-- RETURNS JSONB AS $$
+-- DECLARE
+--     result JSONB;
+--     key TEXT;
+-- BEGIN
+--     result = jdata;
+--     FOREACH key IN ARRAY keys
+--     LOOP
+--         result = (result - key);
+--     END LOOP;
+--     RETURN result;
+-- END;
+-- $$ LANGUAGE plpgsql;
+
+-- CREATE OPERATOR - (
+--     PROCEDURE = jsonb_remove_keys,
+--     LEFTARG   = jsonb,
+--     RIGHTARG  = text[] 
+-- );
